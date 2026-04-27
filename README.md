@@ -223,7 +223,6 @@ grep "steam_guard" logs/FPC.log | tail -20
 ## 📞 Поддержка
 
 - **Telegram:** @MeccCZ
-- **Email:** your@email.com
 - **Issues:** [GitHub Issues](https://github.com/MeccCZ/steam-guard-delivery-plugin/issues)
 
 ## 📄 Лицензия
