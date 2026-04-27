@@ -155,22 +155,6 @@ AB123
 Для получения кодов необходимо повторно приобрести товар.
 ```
 
-## 🛠️ Утилиты
-
-### test_steam_guard.py
-Тестирование генерации кодов перед добавлением в плагин.
-
-```bash
-python utils/test_steam_guard.py
-```
-
-### import_mafiles.py
-Массовый импорт аккаунтов из папки с maFiles.
-
-```bash
-python utils/import_mafiles.py
-```
-
 ## 📁 Структура файлов
 
 ```
