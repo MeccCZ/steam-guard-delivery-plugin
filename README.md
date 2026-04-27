@@ -194,12 +194,6 @@ sudo ntpdate -s time.nist.gov
 grep "steam_guard" logs/FPC.log | tail -20
 ```
 
-## 📚 Документация
-
-- [Подробная инструкция](docs/INSTALLATION.md)
-- [API документация](docs/API.md)
-- [Часто задаваемые вопросы](docs/FAQ.md)
-
 ## 🤝 Вклад в проект
 
 Приветствуются любые улучшения! Создавайте Pull Request или Issue.
