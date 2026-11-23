@@ -1,498 +1,789 @@
-"""
-Плагин для автоматической выдачи Steam Guard кодов покупателям Steam аккаунтов.
-"""
+"""Выдача Steam Guard кодов покупателям через FunPay Cardinal."""
 from __future__ import annotations
-import json
-import time
-import hmac
-import base64
-import struct
-import hashlib
-import re
-from typing import TYPE_CHECKING
-from datetime import datetime, timedelta
-from pathlib import Path
 
-from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent
-from tg_bot.utils import escape
-from tg_bot import CBT
-import tg_bot.static_keyboards
-from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
-import telebot
+import base64
+import hmac
+import json
 import logging
-from locales.localizer import Localizer
+import re
+import struct
+import time
+from datetime import datetime, timedelta
+from html import escape
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from threading import RLock
+from typing import TYPE_CHECKING
+from uuid import uuid4
+
+from FunPayAPI.common.enums import OrderStatuses
+from Utils.cardinal_tools import ENTITY_RE
+from telebot.apihelper import ApiException
+from telebot.handler_backends import ContinueHandling
+from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from tg_bot import CBT
 
 if TYPE_CHECKING:
     from cardinal import Cardinal
+    from FunPayAPI.updater.events import (
+        LastChatMessageChangedEvent,
+        NewMessageEvent,
+        NewOrderEvent,
+        OrderStatusChangedEvent,
+    )
 
-logger = logging.getLogger("FPC.steam_guard")
-localizer = Localizer()
-_ = localizer.translate
 
 NAME = "Steam Guard Delivery"
-VERSION = "1.0.0"
-DESCRIPTION = "Автоматическая выдача Steam Guard кодов покупателям с ограничением по времени (30 дней)"
+VERSION = "1.1.2"
+DESCRIPTION = "Выдача Steam Guard кодов с ограничением по времени или количеству"
 CREDITS = "@mecccz"
 UUID = "8f7a6b5c-4d3e-4f2a-9b8c-7d6e5f4a3b2c"
 SETTINGS_PAGE = True
 
-# Callback data для Telegram бота
-CBT_SETTINGS = "SteamGuard_Settings"
-CBT_ADD_ACCOUNT = "SteamGuard_AddAccount"
-CBT_REMOVE_ACCOUNT = "SteamGuard_RemoveAccount"
-CBT_LIST_ACCOUNTS = "SteamGuard_ListAccounts"
-CBT_VIEW_BUYERS = "SteamGuard_ViewBuyers"
-
-# Настройки по умолчанию
-SETTINGS = {
-    "enabled": True,
-    "access_days": 30,
-    "auto_send_on_purchase": True,
-    "command": "!code",
-    "watermark": False
-}
-
-# Путь к файлам данных
+logger = logging.getLogger("FPC.steam_guard")
 STORAGE_DIR = Path("storage/plugins/steam_guard")
 SETTINGS_FILE = STORAGE_DIR / "settings.json"
 ACCOUNTS_FILE = STORAGE_DIR / "accounts.json"
 BUYERS_FILE = STORAGE_DIR / "buyers.json"
+DATA_LOCK = RLock()
 
-# Структура данных
-# accounts.json: {"account_name": "shared_secret_key"}
-# buyers.json: {"buyer_username": {"account_name": "...", "purchase_date": "...", "expires_at": "..."}}
+DEFAULT_SETTINGS = {
+    "enabled": True,
+    "mode": "time",
+    "access_days": 30,
+    "codes_limit": 5,
+    "auto_send_on_purchase": True,
+    "command": "!code",
+    "watermark": False,
+}
+SETTINGS = DEFAULT_SETTINGS.copy()
+CALLBACK_PREFIX = "sgd:"
+LEGACY_CALLBACKS = {
+    "SteamGuard_Settings:toggle": "toggle",
+    "SteamGuard_Settings:days": "days",
+    "SteamGuard_Settings:auto": "auto",
+    "SteamGuard_Settings:command": "command",
+    "SteamGuard_AddAccount": "add",
+    "SteamGuard_RemoveAccount": "find_account",
+    "SteamGuard_ListAccounts": "accounts",
+    "SteamGuard_ViewBuyers": "buyers",
+}
+STATE = "steam_guard_input"
+PAGE_SIZE = 6
+MAX_ACCESS_DAYS = 36500
+MAX_CODES = 1000000
+MAX_COMMAND_LENGTH = 64
+NO_ACCESS = "❌ У вас нет активного доступа к Steam Guard кодам."
+INVISIBLE_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
 
 
-def generate_steam_code(shared_secret: str) -> str:
-    """
-    Генерирует Steam Guard код из shared secret.
-    
-    :param shared_secret: Base64 закодированный shared secret из maFile
-    :return: 5-символьный Steam Guard код
-    """
+class InputError(ValueError):
+    """Ошибка ввода, которую можно показать пользователю."""
+
+
+def load_json(path: Path) -> dict:
     try:
-        # Декодируем shared secret из base64
-        secret = base64.b64decode(shared_secret)
-        
-        # Получаем текущее время в Unix timestamp
-        timestamp = int(time.time())
-        
-        # Steam использует 30-секундные интервалы
-        time_buffer = struct.pack('>Q', timestamp // 30)
-        
-        # Генерируем HMAC-SHA1
-        hmac_hash = hmac.new(secret, time_buffer, hashlib.sha1).digest()
-        
-        # Извлекаем offset из последнего байта
-        offset = hmac_hash[-1] & 0x0F
-        
-        # Извлекаем 4 байта начиная с offset
-        code_int = struct.unpack('>I', hmac_hash[offset:offset + 4])[0] & 0x7FFFFFFF
-        
-        # Steam использует специальный алфавит
-        chars = '23456789BCDFGHJKMNPQRTVWXY'
-        code = ''
-        
-        for _ in range(5):
-            code += chars[code_int % len(chars)]
-            code_int //= len(chars)
-        
-        return code
-    except Exception as e:
-        logger.error(f"Ошибка при генерации Steam Guard кода: {e}")
-        logger.debug("TRACEBACK", exc_info=True)
+        with path.open(encoding="utf-8-sig") as file:
+            data = json.load(file)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Ожидался JSON-объект в {path}")
+    if path == BUYERS_FILE and any(not isinstance(buyer, dict) for buyer in data.values()):
+        raise ValueError(f"Некорректная запись покупателя в {path}")
+    return data
+
+
+def save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as file:
+            temporary = Path(file.name)
+            json.dump(data, file, indent=4, ensure_ascii=False)
+            file.write("\n")
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def normalize_command(text: str) -> str:
+    return INVISIBLE_RE.sub("", text).strip()
+
+
+def valid_command(command: str) -> bool:
+    return (
+        1 <= len(command) <= MAX_COMMAND_LENGTH
+        and command != "-"
+        and command.isprintable()
+        and not ENTITY_RE.search(command)
+    )
+
+
+def load_settings() -> None:
+    loaded = load_json(SETTINGS_FILE)
+    SETTINGS.clear()
+    SETTINGS.update(DEFAULT_SETTINGS)
+    SETTINGS.update(loaded)
+    if SETTINGS["mode"] not in ("time", "count"):
+        SETTINGS["mode"] = "time"
+    for key, (minimum, maximum) in {
+        "access_days": (0, MAX_ACCESS_DAYS),
+        "codes_limit": (1, MAX_CODES),
+    }.items():
+        value = SETTINGS[key]
+        if type(value) is not int or not minimum <= value <= maximum:
+            SETTINGS[key] = DEFAULT_SETTINGS[key]
+    for key in ("enabled", "auto_send_on_purchase", "watermark"):
+        if type(SETTINGS[key]) is not bool:
+            SETTINGS[key] = DEFAULT_SETTINGS[key]
+    value = SETTINGS["command"]
+    command = normalize_command(value) if isinstance(value, str) else ""
+    SETTINGS["command"] = command if valid_command(command) else DEFAULT_SETTINGS["command"]
+
+
+def update_setting(key: str, value) -> None:
+    updated = {**SETTINGS, key: value}
+    save_json(SETTINGS_FILE, updated)
+    SETTINGS[key] = value
+
+
+def decode_secret(shared_secret: str) -> bytes:
+    secret = base64.b64decode(shared_secret, validate=True)
+    if not secret:
+        raise ValueError("Пустой shared_secret")
+    return secret
+
+
+def generate_steam_code(shared_secret: str, timestamp: int | None = None) -> str | None:
+    try:
+        secret = decode_secret(shared_secret)
+    except (ValueError, TypeError):
         return None
 
+    if timestamp is None:
+        timestamp = int(time.time())
+    digest = hmac.digest(secret, struct.pack(">Q", timestamp // 30), "sha1")
+    offset = digest[-1] & 0x0F
+    number = struct.unpack_from(">I", digest, offset)[0] & 0x7FFFFFFF
+    alphabet = "23456789BCDFGHJKMNPQRTVWXY"
+    code = []
+    for _ in range(5):
+        number, index = divmod(number, len(alphabet))
+        code.append(alphabet[index])
+    return "".join(code)
 
-def load_json(file_path: Path, default=None):
-    """Загружает JSON файл"""
-    if default is None:
-        default = {}
+
+def find_name(names, query: str) -> str | None:
+    if query in names:
+        return query
+    matches = [name for name in names if name.casefold() == query.casefold()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def find_buyer(buyers: dict, buyer_id: int, username: str | None) -> str | None:
+    name = next((name for name, buyer in buyers.items() if buyer.get("buyer_id") == buyer_id), None)
+    if name is not None or not username:
+        return name
+    name = find_name(buyers, username)
+    return name if name is not None and buyers[name].get("buyer_id") is None else None
+
+
+def account_matches(description: str, accounts: dict) -> list[str]:
+    description = description.casefold()
+    return [
+        name for name in accounts
+        if name and re.search(rf"(?<!\w){re.escape(name.casefold())}(?!\w)", description)
+    ]
+
+
+def safe_label(value: str) -> str:
+    return escape(str(value)[:80], quote=False)
+
+
+def is_count_access(buyer: dict) -> bool:
+    return buyer.get("mode", "count" if "codes_limit" in buyer else "time") == "count"
+
+
+def access_status(buyer: dict, accounts: dict) -> tuple[str, str | None]:
+    name = buyer.get("account_name")
+    if not isinstance(name, str) or name not in accounts:
+        return "Аккаунт удалён", "❌ Аккаунт недоступен. Обратитесь к продавцу."
+
+    used = buyer.get("codes_used", 0)
+    if type(used) is not int or used < 0:
+        return "Ошибка данных", "❌ Не удалось проверить доступ. Обратитесь к продавцу."
+    if is_count_access(buyer):
+        limit = buyer.get("codes_limit")
+        if type(limit) is not int or limit < 1:
+            return "Ошибка данных", "❌ Не удалось проверить лимит. Обратитесь к продавцу."
+        status = f"Использовано {used}/{limit}"
+        if used >= limit:
+            return status, f"❌ Лимит кодов исчерпан ({used}/{limit})."
+        return status, None
+
     try:
-        if file_path.exists():
-            with open(file_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке {file_path}: {e}")
-    return default
+        expiry = buyer["expires_at"]
+        if expiry is None:
+            return f"Бессрочно · выдач: {used}", None
+        expiry = datetime.fromisoformat(expiry)
+    except (KeyError, TypeError, ValueError):
+        return "Ошибка данных", "❌ Не удалось проверить срок доступа. Обратитесь к продавцу."
+    date = expiry.strftime("%d.%m.%Y %H:%M")
+    if datetime.now(expiry.tzinfo) >= expiry:
+        return f"Истёк {date} · выдач: {used}", f"❌ Ваш доступ истёк {date}."
+    return f"Действует до {date} · выдач: {used}", None
 
 
-def save_json(file_path: Path, data):
-    """Сохраняет данные в JSON файл"""
-    try:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка при сохранении {file_path}: {e}")
-        return False
+def send_code(
+    cardinal: Cardinal, buyers: dict, username: str, accounts: dict,
+    chat_id: int | str, buyer_id: int, *, automatic: bool = False,
+) -> None:
+    """Вызывается под DATA_LOCK, чтобы две выдачи не превысили лимит."""
+    buyer = buyers[username]
+    if buyer.get("buyer_id") not in (None, buyer_id):
+        return
+    if automatic and buyer.get("auto_sent"):
+        return
 
+    _, error = access_status(buyer, accounts)
+    if error:
+        if not automatic:
+            cardinal.send_message(chat_id, error, username, interlocutor_id=buyer_id, watermark=False)
+        return
 
-def load_settings():
-    """Загружает настройки плагина"""
-    global SETTINGS
-    loaded = load_json(SETTINGS_FILE, SETTINGS)
-    SETTINGS.update(loaded)
-
-
-def save_settings():
-    """Сохраняет настройки плагина"""
-    save_json(SETTINGS_FILE, SETTINGS)
-
-
-def load_accounts():
-    """Загружает список Steam аккаунтов и их shared secrets"""
-    return load_json(ACCOUNTS_FILE, {})
-
-
-def save_accounts(accounts):
-    """Сохраняет список Steam аккаунтов"""
-    save_json(ACCOUNTS_FILE, accounts)
-
-
-def load_buyers():
-    """Загружает список покупателей и их доступы"""
-    return load_json(BUYERS_FILE, {})
-
-
-def save_buyers(buyers):
-    """Сохраняет список покупателей"""
-    save_json(BUYERS_FILE, buyers)
-
-
-def add_buyer_access(buyer_username: str, account_name: str):
-    """
-    Добавляет или обновляет доступ покупателя к Steam Guard кодам
-    
-    :param buyer_username: Имя покупателя на FunPay
-    :param account_name: Название Steam аккаунта
-    """
-    buyers = load_buyers()
-    
-    now = datetime.now()
-    expires_at = now + timedelta(days=SETTINGS["access_days"])
-    
-    buyers[buyer_username] = {
-        "account_name": account_name,
-        "purchase_date": now.isoformat(),
-        "expires_at": expires_at.isoformat()
-    }
-    
-    save_buyers(buyers)
-    logger.info(f"Добавлен доступ для {buyer_username} к аккаунту {account_name} до {expires_at.strftime('%d.%m.%Y %H:%M')}")
-
-
-def check_buyer_access(buyer_username: str) -> tuple[bool, str, str]:
-    """
-    Проверяет доступ покупателя к Steam Guard кодам
-    
-    :param buyer_username: Имя покупателя
-    :return: (имеет_доступ, название_аккаунта, сообщение_об_ошибке)
-    """
-    buyers = load_buyers()
-    
-    if buyer_username not in buyers:
-        return False, None, "❌ У вас нет активного доступа к Steam Guard кодам. Пожалуйста, приобретите аккаунт."
-    
-    buyer_data = buyers[buyer_username]
-    expires_at = datetime.fromisoformat(buyer_data["expires_at"])
-    
-    if datetime.now() > expires_at:
-        return False, None, f"❌ Ваш доступ истек {expires_at.strftime('%d.%m.%Y')}. Для получения кодов необходимо повторно приобрести товар."
-    
-    account_name = buyer_data["account_name"]
-    accounts = load_accounts()
-    
-    if account_name not in accounts:
-        return False, None, "❌ Аккаунт не найден в базе данных. Обратитесь к продавцу."
-    
-    return True, account_name, None
-
-
-def get_steam_code_for_buyer(buyer_username: str) -> str:
-    """
-    Получает Steam Guard код для покупателя
-    
-    :param buyer_username: Имя покупателя
-    :return: Сообщение с кодом или ошибкой
-    """
-    has_access, account_name, error_msg = check_buyer_access(buyer_username)
-    
-    if not has_access:
-        return error_msg
-    
-    accounts = load_accounts()
-    shared_secret = accounts[account_name]
-    
-    code = generate_steam_code(shared_secret)
-    
+    timestamp = int(time.time())
+    code = generate_steam_code(accounts[buyer["account_name"]], timestamp)
     if code is None:
-        return "❌ Ошибка при генерации кода. Обратитесь к продавцу."
-    
-    buyers = load_buyers()
-    expires_at = datetime.fromisoformat(buyers[buyer_username]["expires_at"])
-    days_left = (expires_at - datetime.now()).days
-    
-    return f"""🔐 Steam Guard код для аккаунта {account_name}:
-
-{code}
-
-⏰ Код действителен 30 секунд
-📅 Доступ истекает через {days_left} дн. ({expires_at.strftime('%d.%m.%Y')})
-
-💡 Для получения нового кода напишите: {SETTINGS['command']}"""
-
-
-def init(cardinal: Cardinal):
-    """Инициализация плагина"""
-    tg = cardinal.telegram
-    if not tg:
-        logger.warning("Telegram бот не активен. Настройки плагина через Telegram будут недоступны.")
+        cardinal.send_message(
+            chat_id, "❌ Не удалось получить код. Обратитесь к продавцу.",
+            username, interlocutor_id=buyer_id, watermark=False,
+        )
         return
-    
-    bot = tg.bot
-    
-    # Загружаем настройки
-    load_settings()
-    
-    # Создаем директорию для хранения данных
-    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-    
-    def open_settings(call: telebot.types.CallbackQuery):
-        """Открывает главное меню настроек"""
-        keyboard = K()
-        keyboard.add(B(f"{'🟢' if SETTINGS['enabled'] else '🔴'} Плагин {'включен' if SETTINGS['enabled'] else 'выключен'}", 
-                      callback_data=f"{CBT_SETTINGS}:toggle"))
-        keyboard.add(B(f"⏰ Срок доступа: {SETTINGS['access_days']} дней", 
-                      callback_data=f"{CBT_SETTINGS}:days"))
-        keyboard.add(B(f"{'🟢' if SETTINGS['auto_send_on_purchase'] else '🔴'} Авто-отправка при покупке", 
-                      callback_data=f"{CBT_SETTINGS}:auto"))
-        keyboard.add(B(f"💬 Команда: {SETTINGS['command']}", 
-                      callback_data=f"{CBT_SETTINGS}:command"))
-        keyboard.add(B("➕ Добавить аккаунт", callback_data=CBT_ADD_ACCOUNT))
-        keyboard.add(B("📋 Список аккаунтов", callback_data=CBT_LIST_ACCOUNTS))
-        keyboard.add(B("👥 Список покупателей", callback_data=CBT_VIEW_BUYERS))
-        keyboard.add(B("◀️ Назад", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:0"))
-        
-        text = f"""⚙️ <b>Настройки Steam Guard Delivery</b>
 
-📊 Статус: {'✅ Активен' if SETTINGS['enabled'] else '❌ Отключен'}
-⏰ Срок доступа: {SETTINGS['access_days']} дней
-🤖 Авто-отправка: {'Да' if SETTINGS['auto_send_on_purchase'] else 'Нет'}
-💬 Команда запроса: <code>{SETTINGS['command']}</code>
+    updated = {**buyer, "buyer_id": buyer_id, "codes_used": buyer.get("codes_used", 0) + 1}
+    if automatic:
+        updated["auto_sent"] = True
+    status, _ = access_status(updated, accounts)
+    remaining = ""
+    if is_count_access(updated):
+        remaining = f"\nОсталось кодов: {updated['codes_limit'] - updated['codes_used']}"
+    text = (
+        f"🔐 Steam Guard код: {code}\n"
+        f"⏰ Код действителен ещё {30 - timestamp % 30} сек.\n"
+        f"📊 {status}{remaining}\n"
+        f"💬 Для запроса нового кода напишите {SETTINGS['command']}."
+    )
 
-📦 Аккаунтов в базе: {len(load_accounts())}
-👥 Активных покупателей: {len(load_buyers())}"""
-        
-        bot.edit_message_text(text, call.message.chat.id, call.message.id, reply_markup=keyboard)
-        bot.answer_callback_query(call.id)
-    
-    def toggle_setting(call: telebot.types.CallbackQuery):
-        """Переключает настройки"""
-        action = call.data.split(":")[-1]
-        
-        if action == "toggle":
-            SETTINGS["enabled"] = not SETTINGS["enabled"]
-        elif action == "auto":
-            SETTINGS["auto_send_on_purchase"] = not SETTINGS["auto_send_on_purchase"]
-        
-        save_settings()
-        open_settings(call)
-    
-    def add_account_prompt(call: telebot.types.CallbackQuery):
-        """Запрашивает данные для добавления аккаунта"""
-        text = """➕ <b>Добавление Steam аккаунта</b>
-
-Отправьте данные в формате:
-<code>название_аккаунта|shared_secret</code>
-
-Пример:
-<code>MyAccount|wB2k7j9L3mN5pQ8rT1vX4yZ6aB2cD4eF=</code>
-
-Где взять shared_secret:
-1. Откройте maFile вашего аккаунта
-2. Найдите поле "shared_secret"
-3. Скопируйте значение
-
-Для отмены отправьте: <code>-</code>"""
-        
-        result = bot.send_message(call.message.chat.id, text, 
-                                 reply_markup=tg_bot.static_keyboards.CLEAR_STATE_BTN())
-        tg.set_state(call.message.chat.id, result.id, call.from_user.id, "steam_guard_add_account", {})
-        bot.answer_callback_query(call.id)
-    
-    def add_account_handler(message: telebot.types.Message):
-        """Обрабатывает добавление аккаунта"""
-        tg.clear_state(message.chat.id, message.from_user.id, True)
-        
-        if message.text == "-":
-            keyboard = K().add(B("◀️ К настройкам", callback_data=f"{CBT.PLUGIN_SETTINGS}:{UUID}"))
-            bot.reply_to(message, "❌ Добавление аккаунта отменено.", reply_markup=keyboard)
-            return
-        
-        try:
-            account_name, shared_secret = message.text.strip().split("|")
-            account_name = account_name.strip()
-            shared_secret = shared_secret.strip()
-            
-            # Проверяем, что можем сгенерировать код
-            test_code = generate_steam_code(shared_secret)
-            if test_code is None:
-                raise ValueError("Не удалось сгенерировать код")
-            
-            accounts = load_accounts()
-            accounts[account_name] = shared_secret
-            save_accounts(accounts)
-            
-            keyboard = K().add(B("◀️ К настройкам", callback_data=f"{CBT.PLUGIN_SETTINGS}:{UUID}"))
-            bot.reply_to(message, 
-                        f"✅ Аккаунт <code>{escape(account_name)}</code> успешно добавлен!\n\n"
-                        f"🔐 Тестовый код: <code>{test_code}</code>", 
-                        reply_markup=keyboard)
-            logger.info(f"Добавлен Steam аккаунт: {account_name}")
-            
-        except Exception as e:
-            keyboard = K().add(B("◀️ К настройкам", callback_data=f"{CBT.PLUGIN_SETTINGS}:{UUID}"))
-            bot.reply_to(message, 
-                        f"❌ Ошибка при добавлении аккаунта:\n<code>{escape(str(e))}</code>\n\n"
-                        "Проверьте формат данных.", 
-                        reply_markup=keyboard)
-    
-    def list_accounts(call: telebot.types.CallbackQuery):
-        """Показывает список аккаунтов"""
-        accounts = load_accounts()
-        
-        if not accounts:
-            text = "📋 <b>Список аккаунтов пуст</b>\n\nДобавьте аккаунты для начала работы."
-        else:
-            text = "📋 <b>Список Steam аккаунтов:</b>\n\n"
-            for i, (account_name, secret) in enumerate(accounts.items(), 1):
-                code = generate_steam_code(secret)
-                text += f"{i}. <code>{escape(account_name)}</code>\n   🔐 Код: <code>{code}</code>\n\n"
-        
-        keyboard = K().add(B("◀️ К настройкам", callback_data=f"{CBT.PLUGIN_SETTINGS}:{UUID}"))
-        bot.edit_message_text(text, call.message.chat.id, call.message.id, reply_markup=keyboard)
-        bot.answer_callback_query(call.id)
-    
-    def view_buyers(call: telebot.types.CallbackQuery):
-        """Показывает список покупателей"""
-        buyers = load_buyers()
-        
-        if not buyers:
-            text = "👥 <b>Список покупателей пуст</b>"
-        else:
-            text = "👥 <b>Список покупателей с доступом:</b>\n\n"
-            now = datetime.now()
-            active = 0
-            expired = 0
-            
-            for username, data in buyers.items():
-                expires_at = datetime.fromisoformat(data["expires_at"])
-                is_active = now < expires_at
-                
-                if is_active:
-                    active += 1
-                    days_left = (expires_at - now).days
-                    status = f"✅ {days_left} дн."
-                else:
-                    expired += 1
-                    status = "❌ Истек"
-                
-                text += f"• <code>{escape(username)}</code>\n"
-                text += f"  📦 Аккаунт: <code>{escape(data['account_name'])}</code>\n"
-                text += f"  📅 Статус: {status}\n\n"
-            
-            text += f"\n📊 Активных: {active} | Истекших: {expired}"
-        
-        keyboard = K().add(B("◀️ К настройкам", callback_data=f"{CBT.PLUGIN_SETTINGS}:{UUID}"))
-        bot.edit_message_text(text, call.message.chat.id, call.message.id, reply_markup=keyboard)
-        bot.answer_callback_query(call.id)
-    
-    # Регистрируем обработчики
-    tg.cbq_handler(open_settings, lambda c: f"{CBT.PLUGIN_SETTINGS}:{UUID}" in c.data)
-    tg.cbq_handler(toggle_setting, lambda c: c.data.startswith(f"{CBT_SETTINGS}:"))
-    tg.cbq_handler(add_account_prompt, lambda c: c.data == CBT_ADD_ACCOUNT)
-    tg.cbq_handler(list_accounts, lambda c: c.data == CBT_LIST_ACCOUNTS)
-    tg.cbq_handler(view_buyers, lambda c: c.data == CBT_VIEW_BUYERS)
-    tg.msg_handler(add_account_handler, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, "steam_guard_add_account"))
-    
-    logger.info(f"Плагин {NAME} v{VERSION} инициализирован")
+    # Сохраняем выдачу перед отправкой. При явном отказе Cardinal восстанавливаем лимит.
+    buyers[username] = updated
+    save_json(BUYERS_FILE, buyers)
+    result = cardinal.send_message(
+        chat_id, text, username, interlocutor_id=buyer_id, watermark=SETTINGS["watermark"],
+    )
+    if not result:
+        buyers[username] = buyer
+        save_json(BUYERS_FILE, buyers)
+        logger.warning("Cardinal не подтвердил выдачу кода покупателю %s", username)
 
 
-def new_order_handler(cardinal: Cardinal, event: NewOrderEvent):
-    """Обрабатывает новый заказ и выдает Steam Guard код"""
-    if not SETTINGS["enabled"] or not SETTINGS["auto_send_on_purchase"]:
-        return
-    
+def new_order_handler(cardinal: Cardinal, event: NewOrderEvent) -> None:
     order = event.order
-    accounts = load_accounts()
-    account_name = None
-    
-    # Ищем название аккаунта в описании заказа
-    for acc_name in accounts.keys():
-        if acc_name.lower() in order.description.lower():
-            account_name = acc_name
+    if order.status not in (OrderStatuses.PAID, OrderStatuses.CLOSED) or not order.buyer_id:
+        return
+
+    with DATA_LOCK:
+        if not SETTINGS["enabled"]:
+            return
+        accounts = load_json(ACCOUNTS_FILE)
+        if not account_matches(order.description or "", accounts):
+            return
+
+    # Сверяем совпадение с заголовком оплаченного лота, отдельно от текста в списке продаж.
+    details = cardinal.account.get_order(order.id)
+    if (
+        details.status not in (OrderStatuses.PAID, OrderStatuses.CLOSED)
+        or details.seller_id != cardinal.account.id
+        or details.buyer_id != order.buyer_id
+    ):
+        return
+    username = details.buyer_username or order.buyer_username
+    if not username or not details.chat_id:
+        return
+
+    with DATA_LOCK:
+        if not SETTINGS["enabled"]:
+            return
+        accounts = load_json(ACCOUNTS_FILE)
+        matches = account_matches(details.short_description or "", accounts)
+        if len(matches) != 1:
+            if matches:
+                logger.warning("Несколько Steam аккаунтов в заголовке заказа #%s", order.id)
+            return
+
+        buyers = load_json(BUYERS_FILE)
+        key = find_buyer(buyers, order.buyer_id, username)
+        previous = buyers.get(key)
+        if previous is None or previous.get("order_id") != order.id:
+            order_date = order.date.isoformat() if order.date else None
+            if previous and previous.get("order_date") and order_date and order_date < previous["order_date"]:
+                return
+            now = datetime.now()
+            buyer = {
+                "account_name": matches[0],
+                "buyer_id": order.buyer_id,
+                "order_id": order.id,
+                "order_date": order_date,
+                "purchase_date": now.isoformat(),
+                "mode": SETTINGS["mode"],
+                "codes_used": 0,
+            }
+            if buyer["mode"] == "count":
+                buyer["codes_limit"] = SETTINGS["codes_limit"]
+            else:
+                days = SETTINGS["access_days"]
+                buyer["expires_at"] = (now + timedelta(days=days)).isoformat() if days else None
+            if key is not None and key != username:
+                del buyers[key]
+            key = username
+            buyers[key] = buyer
+            save_json(BUYERS_FILE, buyers)
+        if SETTINGS["auto_send_on_purchase"]:
+            send_code(cardinal, buyers, key, accounts, details.chat_id, order.buyer_id, automatic=True)
+
+
+def order_status_handler(cardinal: Cardinal, event: OrderStatusChangedEvent) -> None:
+    if event.order.status != OrderStatuses.REFUNDED:
+        return
+    with DATA_LOCK:
+        buyers = load_json(BUYERS_FILE)
+        for username, buyer in buyers.items():
+            if buyer.get("order_id") == event.order.id and buyer.get("buyer_id") == event.order.buyer_id:
+                del buyers[username]
+                save_json(BUYERS_FILE, buyers)
+                break
+
+
+def is_command(text: str | None) -> bool:
+    return bool(text and normalize_command(text).casefold() == SETTINGS["command"].casefold())
+
+
+def handle_command(cardinal: Cardinal, message) -> None:
+    buyer_id = message.author_id
+    if not buyer_id or buyer_id <= 0 or buyer_id == cardinal.account.id or buyer_id != message.interlocutor_id:
+        return
+
+    with DATA_LOCK:
+        if not SETTINGS["enabled"] or not is_command(message.text):
+            return
+        buyers = load_json(BUYERS_FILE)
+        username = find_buyer(buyers, buyer_id, message.author)
+        if username is None:
+            cardinal.send_message(
+                message.chat_id, NO_ACCESS, message.chat_name, interlocutor_id=buyer_id, watermark=False,
+            )
+            return
+        send_code(cardinal, buyers, username, load_json(ACCOUNTS_FILE), message.chat_id, buyer_id)
+
+
+def last_chat_message_handler(cardinal: Cardinal, event: LastChatMessageChangedEvent) -> None:
+    chat = event.chat
+    if not (
+        cardinal.old_mode_enabled and SETTINGS["enabled"] and chat.name
+        and not chat.last_by_bot and not chat.last_by_vertex and is_command(chat.last_message_text)
+    ):
+        return
+    messages = cardinal.account.get_chat_history(
+        chat.id, interlocutor_username=chat.name, from_id=chat.node_msg_id,
+    )
+    for message in messages:
+        if message.id == chat.node_msg_id:
+            handle_command(cardinal, message)
             break
-    
-    if not account_name:
-        logger.debug(f"Заказ #{order.id} не содержит Steam аккаунт из базы")
-        return
-    
-    # Добавляем доступ покупателю
-    add_buyer_access(order.buyer_username, account_name)
-    
-    # Получаем код
-    code_message = get_steam_code_for_buyer(order.buyer_username)
-    
-    # Отправляем сообщение
-    chat_id = order.chat_id
-    cardinal.send_message(chat_id, code_message, order.buyer_username, watermark=False)
-    
-    logger.info(f"Отправлен Steam Guard код покупателю {order.buyer_username} для заказа #{order.id}")
 
 
-def new_message_handler(cardinal: Cardinal, event: NewMessageEvent):
-    """Обрабатывает команду запроса Steam Guard кода"""
-    if not SETTINGS["enabled"]:
-        return
-    
-    message = event.message
-    
-    # Проверяем, что это не наше сообщение
-    if message.author_id == cardinal.account.id:
-        return
-    
-    # Получаем текст сообщения
-    if hasattr(message, 'text') and message.text:
-        message_text = message.text
+def new_message_handler(cardinal: Cardinal, event: NewMessageEvent) -> None:
+    if not cardinal.old_mode_enabled:
+        handle_command(cardinal, event.message)
+
+
+def callback(action: str, offset: int, value: int | str = 0) -> str:
+    return f"{CALLBACK_PREFIX}{action}:{offset}:{value}"
+
+
+def button(text: str, action: str, offset: int, value: int | str = 0) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text, callback_data=callback(action, offset, value))
+
+
+def settings_page(offset: int) -> tuple[str, InlineKeyboardMarkup]:
+    accounts = load_json(ACCOUNTS_FILE)
+    buyers = load_json(BUYERS_FILE)
+    active = sum(access_status(buyer, accounts)[1] is None for buyer in buyers.values())
+    keyboard = InlineKeyboardMarkup()
+    enabled = "🟢 Включён" if SETTINGS["enabled"] else "🔴 Выключен"
+    auto = "🟢" if SETTINGS["auto_send_on_purchase"] else "🔴"
+    mode = "по времени" if SETTINGS["mode"] == "time" else "по количеству"
+    keyboard.add(button(enabled, "toggle", offset))
+    keyboard.add(button(f"🔄 Режим: {mode}", "mode", offset))
+    if SETTINGS["mode"] == "time":
+        days = SETTINGS["access_days"]
+        label = f"{days} дн." if days else "бессрочно"
+        keyboard.add(button(f"⏰ Срок доступа: {label}", "days", offset))
     else:
-        message_text = str(message)
-    
-    # Удаляем все невидимые Unicode символы
-    message_text = re.sub(r'[\u200B-\u200D\uFEFF\u00A0]', '', message_text)
-    message_text = message_text.strip()
-    
-    # Проверяем команду
-    if message_text.lower() != SETTINGS["command"].lower():
-        return
-    
-    buyer_username = message.author
-    chat_id = message.chat_id
-    chat_name = message.chat_name
-    
-    logger.info(f"✅ Получен запрос Steam Guard кода от {buyer_username}")
-    
-    # Получаем код
-    code_message = get_steam_code_for_buyer(buyer_username)
-    
-    # Отправляем сообщение
-    cardinal.send_message(chat_id, code_message, chat_name, watermark=False)
-    logger.info(f"✅ Отправлен код покупателю {buyer_username}")
+        keyboard.add(button(f"🔢 Лимит кодов: {SETTINGS['codes_limit']}", "limit", offset))
+    keyboard.add(button(f"{auto} Код сразу после покупки", "auto", offset))
+    keyboard.add(button(f"💬 Команда: {SETTINGS['command']}", "command", offset))
+    keyboard.add(button("➕ Добавить аккаунт", "add", offset))
+    keyboard.add(button("📋 Список аккаунтов", "accounts", offset))
+    keyboard.add(button("👥 Список покупателей", "buyers", offset))
+    keyboard.add(InlineKeyboardButton("◀️ Назад", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:{offset}"))
+    return (
+        "<b>⚙️ Настройки Steam Guard Delivery</b>\n\n"
+        f"📦 Аккаунтов: {len(accounts)}\n👥 Активных покупателей: {active} из {len(buyers)}",
+        keyboard,
+    )
 
 
-# Привязка обработчиков к событиям
+def list_page(kind: str, offset: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    accounts = load_json(ACCOUNTS_FILE)
+    is_buyers = kind == "buyers"
+    entries = load_json(BUYERS_FILE) if is_buyers else accounts
+    names = sorted(entries, key=str.casefold)
+    last_page = max(0, (len(names) - 1) // PAGE_SIZE)
+    page = min(page, last_page)
+    keyboard = InlineKeyboardMarkup()
+    title = "Покупатели" if is_buyers else "Steam аккаунты"
+    lines = [f"<b>{title}</b>", ""]
+    for name in names[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
+        if is_buyers:
+            buyer = entries[name]
+            status, _ = access_status(buyer, accounts)
+            lines.append(f"• <code>{safe_label(name)}</code> → <code>{safe_label(buyer.get('account_name', '—'))}</code>")
+            lines.append(f"  {status}")
+        else:
+            code = generate_steam_code(entries[name])
+            lines.append(f"• <code>{safe_label(name)}</code> · <code>{code or 'ошибка ключа'}</code>")
+
+    if not names:
+        lines.append("Список пуст.")
+    if last_page:
+        lines.append(f"\nСтраница {page + 1} из {last_page + 1}")
+        navigation = []
+        if page:
+            navigation.append(button("⬅️", kind, offset, page - 1))
+        if page < last_page:
+            navigation.append(button("➡️", kind, offset, page + 1))
+        keyboard.row(*navigation)
+    if names:
+        action = "find_buyer" if is_buyers else "find_account"
+        keyboard.add(button("🔍 Поиск и удаление", action, offset, page))
+    keyboard.add(button("◀️ К настройкам", "settings", offset))
+    return "\n".join(lines), keyboard
+
+
+PROMPTS = {
+    "days": f"Введите срок доступа в днях от 0 до {MAX_ACCESS_DAYS}. 0 означает бессрочный доступ.",
+    "limit": f"Введите лимит выдач от 1 до {MAX_CODES}.",
+    "command": (
+        f"Отправьте текст, который покупатель должен написать в FunPay. До {MAX_COMMAND_LENGTH} символов в одной строке.\n"
+        "Например <code>!code</code>, <code>/code</code> или <code>дай код</code>."
+    ),
+    "add": "Отправьте <code>название_аккаунта|shared_secret</code>.",
+    "find_account": "Введите название Steam аккаунта.",
+    "find_buyer": "Введите ник покупателя на FunPay.",
+}
+SEARCH_LISTS = {"find_account": "accounts", "find_buyer": "buyers"}
+
+
+def init(cardinal: Cardinal) -> None:
+    try:
+        load_settings()
+    except (OSError, ValueError):
+        SETTINGS["enabled"] = False
+        logger.exception("Не удалось загрузить настройки Steam Guard. Выдача отключена.")
+    tg = cardinal.telegram
+    if tg is not None:
+        register_telegram(cardinal)
+    logger.info("Плагин %s v%s инициализирован", NAME, VERSION)
+
+
+def register_telegram(cardinal: Cardinal) -> None:
+    tg = cardinal.telegram
+    bot = tg.bot
+    settings_callback = f"{CBT.PLUGIN_SETTINGS}:{UUID}"
+    back_callback = f"{CBT.EDIT_PLUGIN}:{UUID}:"
+
+    def state_for(message, user_id):
+        state = tg.get_state(message.chat.id, user_id)
+        return state if state and state["state"] == STATE else None
+
+    def answer(call, text=None):
+        bot.answer_callback_query(call.id, text)
+
+    def show(chat_id, message_id, text, keyboard):
+        try:
+            bot.edit_message_text(
+                text, chat_id, message_id, reply_markup=keyboard, parse_mode="HTML",
+            )
+        except ApiException as exc:
+            if "message is not modified" not in str(exc).casefold():
+                raise
+
+    def prompt(call, action, offset, page):
+        token = uuid4().hex
+        keyboard = InlineKeyboardMarkup().add(button("Отмена", "cancel", offset, token))
+        message = bot.send_message(call.message.chat.id, PROMPTS[action], reply_markup=keyboard)
+        tg.set_state(call.message.chat.id, message.message_id, call.from_user.id, STATE, {
+            "action": action, "offset": offset, "page": page, "token": token,
+            "kind": SEARCH_LISTS.get(action), "menu_id": call.message.message_id,
+        })
+
+    def confirm_or_cancel(call, action, token):
+        state = state_for(call.message, call.from_user.id)
+        if not state or state["mid"] != call.message.message_id or state["data"]["token"] != token:
+            return "Это действие уже закрыто."
+        data = state["data"]
+        if action == "delete":
+            if data["action"] != "confirm":
+                return "Подтверждение устарело."
+            entries = load_json(data["path"])
+            name = data["name"]
+            if name not in entries or entries[name] != data["entry"]:
+                tg.clear_state(call.message.chat.id, call.from_user.id, True)
+                return "Запись уже изменилась. Повторите поиск."
+            del entries[name]
+            save_json(data["path"], entries)
+        tg.clear_state(call.message.chat.id, call.from_user.id)
+        offset = data["offset"]
+        kind = data.get("kind")
+        if kind:
+            text, keyboard = list_page(kind, offset, data["page"])
+        else:
+            text, keyboard = settings_page(offset)
+        if action == "delete":
+            text = "✅ Запись удалена.\n\n" + text
+        show(call.message.chat.id, call.message.message_id, text, keyboard)
+        return None
+
+    def route(call):
+        msg = call.message
+        feedback = None
+        try:
+            if not msg or msg.chat.type != "private" or call.from_user.id not in tg.authorized_users:
+                feedback = "Откройте настройки в личном чате с ботом."
+                return
+            if UUID not in cardinal.plugins:
+                feedback = "Плагин удалён."
+                return
+            parts = call.data.split(":")
+            if call.data in LEGACY_CALLBACKS:
+                action, raw_offset, value = LEGACY_CALLBACKS[call.data], "0", "0"
+            elif parts[0] == CALLBACK_PREFIX[:-1]:
+                _, action, raw_offset, value = parts
+            else:
+                action, value = "settings", "0"
+                raw_offset = parts[2] if len(parts) == 3 else "0"
+            offset = int(raw_offset)
+            if offset < 0:
+                raise ValueError("Некорректная позиция списка")
+
+            with DATA_LOCK:
+                if action in ("cancel", "delete"):
+                    feedback = confirm_or_cancel(call, action, value)
+                    return
+                page = max(0, int(value))
+                existing = tg.get_state(msg.chat.id, call.from_user.id)
+                if action in PROMPTS:
+                    if existing and existing["state"] != STATE:
+                        feedback = "Завершите или отмените открытое действие в Cardinal."
+                        return
+                    if existing:
+                        tg.clear_state(msg.chat.id, call.from_user.id, True)
+                    prompt(call, action, offset, page)
+                    return
+                if existing and existing["state"] == STATE:
+                    tg.clear_state(msg.chat.id, call.from_user.id, existing["mid"] != msg.message_id)
+                if action == "toggle":
+                    update_setting("enabled", not SETTINGS["enabled"])
+                elif action == "auto":
+                    update_setting("auto_send_on_purchase", not SETTINGS["auto_send_on_purchase"])
+                elif action == "mode":
+                    update_setting("mode", "count" if SETTINGS["mode"] == "time" else "time")
+                elif action in ("accounts", "buyers"):
+                    show(msg.chat.id, msg.message_id, *list_page(action, offset, page))
+                    return
+                elif action != "settings":
+                    feedback = "Откройте настройки заново."
+                    return
+                show(msg.chat.id, msg.message_id, *settings_page(offset))
+        except (OSError, ValueError, ApiException):
+            logger.exception("Не удалось обработать кнопку Steam Guard")
+            feedback = "Не удалось выполнить действие. Проверьте журнал Cardinal."
+        finally:
+            answer(call, feedback)
+
+    def open_confirmation(message, data, user_id):
+        kind = data["kind"]
+        path = BUYERS_FILE if kind == "buyers" else ACCOUNTS_FILE
+        entries = load_json(path)
+        name = find_name(entries, message.text.strip())
+        if name is None:
+            raise InputError("Запись не найдена. Введите точное имя.")
+        text = f"Удалить <code>{safe_label(name)}</code>?"
+        if kind == "buyers":
+            status, _ = access_status(entries[name], load_json(ACCOUNTS_FILE))
+            text += f"\nАккаунт: <code>{safe_label(entries[name].get('account_name', '—'))}</code>\n{status}"
+        else:
+            text += "\nПокупатели потеряют доступ к кодам этого аккаунта."
+        token = data["token"]
+        offset = data["offset"]
+        keyboard = InlineKeyboardMarkup().row(
+            button("Удалить", "delete", offset, token), button("Отмена", "cancel", offset, token),
+        )
+        confirmation = bot.send_message(message.chat.id, text, reply_markup=keyboard)
+        tg.clear_state(message.chat.id, user_id, True)
+        tg.set_state(message.chat.id, confirmation.message_id, user_id, STATE, {
+            **data, "action": "confirm", "path": path, "name": name, "entry": entries[name],
+        })
+
+    def add_account(value: str) -> str:
+        name, divider, secret = value.partition("|")
+        name = name.strip()
+        secret = secret.strip()
+        if not divider or not 1 <= len(name) <= 64 or not name.isprintable():
+            raise InputError("Введите название до 64 символов и shared_secret через |.")
+        try:
+            decode_secret(secret)
+        except ValueError:
+            raise InputError("Некорректный shared_secret. Проверьте значение из maFile.") from None
+        accounts = load_json(ACCOUNTS_FILE)
+        existing = find_name(accounts, name)
+        if existing is not None:
+            accounts[existing] = secret
+            save_json(ACCOUNTS_FILE, accounts)
+            return f"✅ Ключ аккаунта <code>{safe_label(existing)}</code> обновлён."
+        if any(existing.casefold() == name.casefold() for existing in accounts):
+            raise InputError("Найдено несколько аккаунтов. Введите название с точным регистром.")
+        buyers = load_json(BUYERS_FILE)
+        # Доступы удалённого аккаунта не должны перейти к новому с тем же именем.
+        kept = {
+            username: buyer for username, buyer in buyers.items()
+            if str(buyer.get("account_name", "")).casefold() != name.casefold()
+        }
+        if len(kept) != len(buyers):
+            save_json(BUYERS_FILE, kept)
+        accounts[name] = secret
+        save_json(ACCOUNTS_FILE, accounts)
+        return f"✅ Аккаунт <code>{safe_label(name)}</code> добавлен."
+
+    def apply_input(action, text):
+        if action == "add":
+            return add_account(text)
+        if action == "command":
+            command = normalize_command(text)
+            if ENTITY_RE.search(command):
+                raise InputError("Команда содержит служебную подстановку Cardinal. Уберите её.")
+            if not valid_command(command):
+                raise InputError(f"Введите от 1 до {MAX_COMMAND_LENGTH} символов в одной строке.")
+            update_setting("command", command)
+            return f"✅ Команда сохранена: <code>{escape(command)}</code>."
+        else:
+            minimum, maximum = (0, MAX_ACCESS_DAYS) if action == "days" else (1, MAX_CODES)
+            if not re.fullmatch(r"[0-9]{1,7}", text) or not minimum <= int(text) <= maximum:
+                raise InputError(f"Введите целое число от {minimum} до {maximum}.")
+            key = "access_days" if action == "days" else "codes_limit"
+            update_setting(key, int(text))
+        return "✅ Настройка сохранена."
+
+    def input_state(message):
+        if (
+            message.chat.type != "private" or message.from_user is None
+            or message.from_user.id not in tg.authorized_users or UUID not in cardinal.plugins
+        ):
+            return None
+        state = state_for(message, message.from_user.id)
+        reply = message.reply_to_message
+        if (
+            state and state["data"]["action"] in PROMPTS and message.message_id > state["mid"]
+            and (reply is None or reply.message_id == state["mid"])
+        ):
+            return state
+        return None
+
+    def on_input(message):
+        user_id = message.from_user.id
+        chat_id = message.chat.id
+        with DATA_LOCK:
+            state = input_state(message)
+            if state is None:
+                return
+            data = state["data"]
+            action = data["action"]
+            value = message.text.strip()
+            offset = data["offset"]
+            kind = data["kind"]
+            if value == "-":
+                tg.clear_state(chat_id, user_id, True)
+                keyboard = InlineKeyboardMarkup().add(button("◀️ Назад", kind or "settings", offset, data["page"]))
+                bot.send_message(chat_id, "Действие отменено.", reply_markup=keyboard)
+                return
+            if action == "add":
+                try:
+                    bot.delete_message(chat_id, message.message_id)
+                except ApiException:
+                    logger.warning("Telegram не удалил сообщение с данными аккаунта")
+            try:
+                if kind:
+                    open_confirmation(message, data, user_id)
+                    return
+                result = apply_input(action, value)
+            except InputError as exc:
+                bot.send_message(chat_id, f"❌ {escape(str(exc))} Попробуйте ещё раз.")
+                return
+            except (OSError, ValueError):
+                logger.exception("Не удалось обработать данные Steam Guard")
+                bot.send_message(chat_id, "Не удалось обработать данные. Проверьте журнал Cardinal.")
+                return
+            tg.clear_state(chat_id, user_id, True)
+            text, keyboard = settings_page(offset)
+            try:
+                show(chat_id, data["menu_id"], text, keyboard)
+            except ApiException:
+                bot.send_message(chat_id, f"{result}\n\n{text}", reply_markup=keyboard)
+            else:
+                bot.send_message(chat_id, result)
+
+    def is_callback(call):
+        data = call.data or ""
+        return (
+            data.startswith(CALLBACK_PREFIX) or data in LEGACY_CALLBACKS or data == settings_callback
+            or data.startswith(settings_callback + ":")
+        )
+
+    def clear_before_back(call):
+        message = call.message
+        if message and message.chat.type == "private" and call.from_user.id in tg.authorized_users:
+            with DATA_LOCK:
+                state = state_for(message, call.from_user.id)
+                if state:
+                    tg.clear_state(message.chat.id, call.from_user.id, state["mid"] != message.message_id)
+        return ContinueHandling()
+
+    bot.register_callback_query_handler(
+        clear_before_back, func=lambda call: (call.data or "").startswith(back_callback),
+    )
+    tg.cbq_handler(route, is_callback)
+    tg.msg_handler(on_input, func=lambda message: input_state(message) is not None, content_types=["text"])
+    # Пока открыта форма, текст вроде /menu должен попасть в неё раньше команд Cardinal.
+    bot.message_handlers.insert(0, bot.message_handlers.pop())
+
+
 BIND_TO_PRE_INIT = [init]
 BIND_TO_NEW_ORDER = [new_order_handler]
+BIND_TO_ORDER_STATUS_CHANGED = [order_status_handler]
 BIND_TO_NEW_MESSAGE = [new_message_handler]
+BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [last_chat_message_handler]
 BIND_TO_DELETE = None
