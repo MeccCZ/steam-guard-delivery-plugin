@@ -12,7 +12,7 @@
 
 ```bash
 # Скачайте файл напрямую
-wget https://raw.githubusercontent.com/MeccCZ/steam-guard-delivery-plugin/main/steam_guard_delivery.py
+wget https://raw.githubusercontent.com/MeccCZ/steam-guard-delivery-plugin/v1.1.2/steam_guard_delivery.py
 
 # Или клонируйте весь репозиторий
 git clone https://github.com/MeccCZ/steam-guard-delivery-plugin.git
@@ -151,7 +151,7 @@ sudo ntpdate -s time.nist.gov
 **Решение:**
 1. Проверьте, что название аккаунта есть в кратком описании лота
 2. Проверьте, что аккаунт добавлен в базу (📋 Список аккаунтов)
-3. Проверьте логи: `grep "steam_guard" logs/FPC.log`
+3. Проверьте логи: `grep "steam_guard" logs/log.log`
 
 ---
 
@@ -162,7 +162,7 @@ sudo ntpdate -s time.nist.gov
 **Решение:**
 1. Проверьте, что плагин включен
 2. Проверьте, что у покупателя есть доступ (👥 Список покупателей)
-3. Проверьте логи: `grep "steam_guard" logs/FPC.log`
+3. Проверьте логи: `grep "steam_guard" logs/log.log`
 
 ## Безопасность
 
@@ -197,7 +197,7 @@ sudo ntpdate -s time.nist.gov
 
 2. **Скачайте новую версию**
    ```bash
-   wget https://raw.githubusercontent.com/MeccCZ/steam-guard-delivery-plugin/main/steam_guard_delivery.py -O plugins/steam_guard_delivery.py
+   wget https://raw.githubusercontent.com/MeccCZ/steam-guard-delivery-plugin/v1.1.2/steam_guard_delivery.py -O plugins/steam_guard_delivery.py
    ```
 
 3. **Перезапустите Cardinal**
@@ -234,7 +234,7 @@ sudo ntpdate -s time.nist.gov
 Если у вас возникли проблемы:
 
 1. **Проверьте документацию:** [README.md](README.md)
-2. **Проверьте логи:** `grep "steam_guard" logs/FPC.log`
+2. **Проверьте логи:** `grep "steam_guard" logs/log.log`
 3. **Создайте Issue:** [GitHub Issues](https://github.com/MeccCZ/steam-guard-delivery-plugin/issues)
 4. **Telegram:** @MeccCZ
 
